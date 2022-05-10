@@ -2,8 +2,6 @@ package tlsmux
 
 import (
 	"crypto/tls"
-	"crypto/x509"
-	"io"
 	"net"
 	"regexp"
 	"strings"
@@ -21,6 +19,8 @@ import (
 const (
 	http2NextProtoTLS = "h2"
 )
+
+type CertificateGeter = func(serverName string) (*tls.Certificate, error)
 
 type tlsMuxListener struct {
 	net.Listener
@@ -46,7 +46,7 @@ func (c *tlsMuxListener) Close() error {
 	return err
 }
 
-func New(logger logrus.FieldLogger, listener net.Listener, cert *x509.Certificate, tlsCert tls.Certificate, keyLogWriter io.Writer) (net.Listener, net.Listener) {
+func New(logger logrus.FieldLogger, listener net.Listener, getCert CertificateGeter, tlsConfig tls.Config) (net.Listener, net.Listener) {
 	var nonTLSConns = make(chan net.Conn, 128) // TODO decide on good buffer sizes for these channels
 	var nonTLSErrs = make(chan error, 128)
 	var tlsConns = make(chan net.Conn, 128)
@@ -69,7 +69,7 @@ func New(logger logrus.FieldLogger, listener net.Listener, cert *x509.Certificat
 					tlsErrs <- err
 				}
 				if isTLS {
-					handleTLSConn(logger, conn, cert, tlsConns)
+					handleTLSConn(logger, conn, getCert, tlsConns)
 				} else {
 					nonTLSConns <- conn
 				}
@@ -88,9 +88,8 @@ func New(logger logrus.FieldLogger, listener net.Listener, cert *x509.Certificat
 		false,
 	}
 
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		KeyLogWriter: keyLogWriter,
+	tlsConfig.GetCertificate = func(clientHello *tls.ClientHelloInfo) (cert *tls.Certificate, err error) {
+		return getCert(clientHello.ServerName)
 	}
 	// Support HTTP/2: https://golang.org/pkg/net/http/?m=all#Serve
 	tlsConfig.NextProtos = append(tlsConfig.NextProtos, http2NextProtoTLS)
@@ -100,14 +99,14 @@ func New(logger logrus.FieldLogger, listener net.Listener, cert *x509.Certificat
 			Listener: listener,
 			close:    closer,
 			conns:    tlsConns,
-		}, tlsConfig),
+		}, &tlsConfig),
 		true,
 	}
 	return nonTLSListener, tlsListener
 }
 
-func handleTLSConn(logger logrus.FieldLogger, conn net.Conn, cert *x509.Certificate, tlsConns chan net.Conn) {
-	logger.Debugf("Handling TLS connection %v", conn)
+func handleTLSConn(logger logrus.FieldLogger, conn net.Conn, getCert CertificateGeter, tlsConns chan net.Conn) {
+	logger.Debugf("Handling TLS connection %v", conn.RemoteAddr())
 
 	proxConn, ok := conn.(proxiedConnection)
 	if !ok {
@@ -126,10 +125,13 @@ func handleTLSConn(logger logrus.FieldLogger, conn net.Conn, cert *x509.Certific
 
 	// trim the port suffix
 	originalHostname := strings.Split(proxConn.OriginalDestination(), ":")[0]
-	if cert != nil && cert.VerifyHostname(originalHostname) == nil {
-		// the certificate we have allows us to intercept this connection
-		tlsConns <- conn
-		return
+	if getCert != nil {
+		cert, err := getCert(originalHostname)
+		if err == nil && cert != nil {
+			// the certificate we have allows us to intercept this connection
+			tlsConns <- conn
+			return
+		}
 	}
 
 	// cannot intercept so will just transparently proxy instead

@@ -3,13 +3,12 @@ package grpc_proxy
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/bradleyjkemp/grpc-tools/internal"
 	"github.com/bradleyjkemp/grpc-tools/internal/codec"
@@ -32,12 +31,13 @@ type server struct {
 	grpcServer    *grpc.Server
 	logger        logrus.FieldLogger
 
-	networkInterface string
-	port             int
-	certFile         string
-	keyFile          string
-	x509Cert         *x509.Certificate
-	tlsCert          tls.Certificate
+	networkInterface   string
+	port               int
+	certFile           string
+	keyFile            string
+	harFile            string
+	tlsCert            tls.Certificate
+	getX509Certificate tlsmux.CertificateGeter
 
 	destination string
 	connPool    *internal.ConnPool
@@ -88,6 +88,14 @@ func New(configurators ...Configurator) (*server, error) {
 		}
 	}
 
+	s.getX509Certificate = func(serverName string) (*tls.Certificate, error) {
+		if cert, err := QueryTlsCertificate(serverName); nil == err {
+			return cert, err
+		}
+
+		return CreateTlsCertificate(nil, serverName, -(365 * 24 * time.Hour), 200)
+	}
+
 	if s.certFile != "" && s.keyFile != "" {
 		var err error
 		s.tlsCert, err = tls.LoadX509KeyPair(s.certFile, s.keyFile)
@@ -95,9 +103,8 @@ func New(configurators ...Configurator) (*server, error) {
 			return nil, err
 		}
 
-		s.x509Cert, err = x509.ParseCertificate(s.tlsCert.Certificate[0]) //TODO do we need to parse anything other than [0]?
-		if err != nil {
-			return nil, err
+		s.getX509Certificate = func(serverName string) (*tls.Certificate, error) {
+			return &s.tlsCert, nil
 		}
 	}
 
@@ -111,8 +118,8 @@ func (s *server) Start() error {
 		return fmt.Errorf("failed to listen on interface (%s:%d): %v", s.networkInterface, s.port, err)
 	}
 	s.logger.Infof("Listening on %s", s.listener.Addr())
-	if s.x509Cert != nil {
-		s.logger.Infof("Intercepting TLS connections to domains: %s", s.x509Cert.DNSNames)
+	if s.getX509Certificate != nil {
+		s.logger.Infof("Start Intercepting TLS connections")
 	} else {
 		s.logger.Infof("Not intercepting TLS connections")
 	}
@@ -124,19 +131,22 @@ func (s *server) Start() error {
 	)
 
 	proxyLis := newProxyListener(s.logger, s.listener)
-	httpReverseProxy := newReverseProxy(s.logger)
+	httpReverseProxy := newReverseProxy(s.logger, s.harFile)
 	httpServer := newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect, httpReverseProxy)
 	httpsServer := withHttpsMiddleware(newHttpServer(s.logger, grpcWebHandler, proxyLis.internalRedirect, httpReverseProxy))
 
+	tlsConf := tls.Config{
+		Certificates: []tls.Certificate{s.tlsCert},
+	}
+
 	// Use file path for Master Secrets file is specified. Send to /dev/null if not.
-	keyLogWriter := ioutil.Discard
 	if s.tlsSecretsFile != "" {
-		keyLogWriter, err = os.OpenFile(s.tlsSecretsFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		tlsConf.KeyLogWriter, err = os.OpenFile(s.tlsSecretsFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 		if err != nil {
 			return fmt.Errorf("failed opening secrets file on path: %s", s.tlsSecretsFile)
 		}
 	}
-	httpLis, httpsLis := tlsmux.New(s.logger, proxyLis, s.x509Cert, s.tlsCert, keyLogWriter)
+	httpLis, httpsLis := tlsmux.New(s.logger, proxyLis, s.getX509Certificate, tlsConf)
 
 	errChan := make(chan error)
 	if s.enableSystemProxy {

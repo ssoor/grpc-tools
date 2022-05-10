@@ -37,10 +37,21 @@ func newHttpServer(logger logrus.FieldLogger, grpcHandler grpcWebServer, interna
 				r.Header.Del("Proxy-Connection")
 				grpcHandler.ServeHTTP(w, r)
 			default:
+				r.URL.Host = r.Host
+				// Because of the TLSmux used to server HTTP and HTTPS on the same port
+				// we have to rely on the Forwarded header (added by middleware) to
+				// tell which protocol to use for proxying.
+				// (we could always set HTTP but would mean relying on the upstream
+				// properly redirecting HTTP->HTTPS)
+				if marker.IsTLSRequest(r.Header) {
+					r.URL.Scheme = "https"
+				} else {
+					r.URL.Scheme = "http"
+				}
 				// Many clients use a mix of gRPC and non-gRPC requests
 				// so must try to be as transparent as possible for normal
 				// HTTP requests by proxying the request to the original destination.
-				logger.Debugf("Reverse proxying HTTP request %s %s %s", r.Method, r.Host, r.URL)
+				logger.Debugf("Reverse proxying request %s %s", r.Method, r.URL)
 				reverseProxy.ServeHTTP(w, r)
 			}
 		}), &http2.Server{}),
@@ -66,7 +77,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, internalRedirect func
 	}
 }
 
-func newReverseProxy(logger logrus.FieldLogger) *httputil.ReverseProxy {
+func newReverseProxy(logger logrus.FieldLogger, harFile string) *httputil.ReverseProxy {
 	logger = logger.WithField("", "http_reverse_proxy")
 	return &httputil.ReverseProxy{
 		Director: func(request *http.Request) {
@@ -82,6 +93,7 @@ func newReverseProxy(logger logrus.FieldLogger) *httputil.ReverseProxy {
 			}
 			request.URL.Host = request.Host
 		},
+		Transport: NewHTTPTransport(&http.Transport{}, harFile),
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logger.WithError(err).Debug("http proxy error")
 			w.WriteHeader(http.StatusBadGateway)
