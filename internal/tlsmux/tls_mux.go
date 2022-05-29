@@ -2,12 +2,14 @@ package tlsmux
 
 import (
 	"crypto/tls"
+	"encoding/binary"
+	"errors"
 	"net"
-	"regexp"
-	"strings"
+	"os"
+	"strconv"
 	"sync"
+	"syscall"
 
-	"github.com/bradleyjkemp/grpc-tools/internal/peekconn"
 	"github.com/sirupsen/logrus"
 )
 
@@ -51,9 +53,58 @@ func New(logger logrus.FieldLogger, listener net.Listener, getCert CertificateGe
 	var nonTLSErrs = make(chan error, 128)
 	var tlsConns = make(chan net.Conn, 128)
 	var tlsErrs = make(chan error, 128)
+
+	opts := []ListenerOptions{
+		WithPeekConn(),
+		WithTLSMiddleware(func(c net.Conn) (net.Conn, error) {
+			tlsConns <- c
+			return nil, nil
+		}, 0),
+		WithHTTPMiddleware(func(c net.Conn) (net.Conn, error) {
+			nonTLSConns <- c
+			return nil, nil
+		}, 0),
+		WithMiddleware(func(c net.Conn) (net.Conn, error) {
+			type proxiedConnection interface {
+				OriginalDestination() (tls bool, addr string)
+			}
+
+			proxConn, ok := c.(proxiedConnection)
+			if !ok {
+				return c, nil
+			}
+
+			go func() {
+				originalTls, originalAddr := proxConn.OriginalDestination()
+				// cannot intercept so will just transparently proxy instead
+				logger.Debugf("No certificate able to intercept connections to %s, proxying instead.", originalAddr)
+				var err error
+				var destConn net.Conn
+				if originalTls {
+					destConn, err = tls.Dial(c.LocalAddr().Network(), originalAddr, nil)
+				} else {
+					destConn, err = net.Dial(c.LocalAddr().Network(), originalAddr)
+				}
+				if err != nil {
+					logger.WithError(err).Debugf("Failed proxying connection to %s, Error while dialing.", originalAddr)
+					_ = c.Close()
+					return
+				}
+
+				err = forwardConnection(c, destConn)
+				if err != nil {
+					logger.WithError(err).Warnf("Error proxying connection to %s.", originalAddr)
+				}
+			}()
+
+			return nil, nil
+		}),
+	}
+
+	hlisten := NewListener(listener, opts...)
 	go func() {
 		for {
-			rawConn, err := listener.Accept()
+			c, err := hlisten.Accept()
 			if err != nil {
 				nonTLSErrs <- err
 				tlsErrs <- err
@@ -61,166 +112,89 @@ func New(logger logrus.FieldLogger, listener net.Listener, getCert CertificateGe
 			}
 
 			go func() {
-				conn := peekconn.New(rawConn)
-
-				isTLS, err := conn.PeekMatch(tlsPattern, tlsPeekSize)
-				if err != nil {
+				if err := handleConn(logger, c); err != nil {
 					nonTLSErrs <- err
 					tlsErrs <- err
-				}
-				if isTLS {
-					handleTLSConn(logger, conn, getCert, tlsConns)
-				} else {
-					nonTLSConns <- conn
 				}
 			}()
 
 		}
 	}()
+
 	closer := &sync.Once{}
-	nonTLSListener := nonHTTPBouncer{
-		logger,
-		&tlsMuxListener{
-			Listener: listener,
-			close:    closer,
-			conns:    nonTLSConns,
-		},
-		false,
+	nonTLSListener := &tlsMuxListener{
+		Listener: listener,
+		close:    closer,
+		conns:    nonTLSConns,
 	}
 
+	// Support HTTP/2: https://golang.org/pkg/net/http/?m=all#Serve
+	tlsConfig.NextProtos = append(tlsConfig.NextProtos, http2NextProtoTLS)
 	tlsConfig.GetCertificate = func(clientHello *tls.ClientHelloInfo) (cert *tls.Certificate, err error) {
 		return getCert(clientHello.ServerName)
 	}
-	// Support HTTP/2: https://golang.org/pkg/net/http/?m=all#Serve
-	tlsConfig.NextProtos = append(tlsConfig.NextProtos, http2NextProtoTLS)
-	tlsListener := nonHTTPBouncer{
-		logger,
-		tls.NewListener(&tlsMuxListener{
-			Listener: listener,
-			close:    closer,
-			conns:    tlsConns,
-		}, &tlsConfig),
-		true,
-	}
+
+	tlsListener := tls.NewListener(&tlsMuxListener{
+		Listener: listener,
+		close:    closer,
+		conns:    tlsConns,
+	}, &tlsConfig)
+
 	return nonTLSListener, tlsListener
 }
 
-func handleTLSConn(logger logrus.FieldLogger, conn net.Conn, getCert CertificateGeter, tlsConns chan net.Conn) {
-	logger.Debugf("Handling TLS connection %v", conn.RemoteAddr())
-
-	proxConn, ok := conn.(proxiedConnection)
-	if !ok {
-		tlsConns <- conn
-		return
-	}
-
-	if proxConn.OriginalDestination() == "" {
-		logger.Debug("Connection has no original destination so must intercept")
-		// cannot be forwarded so must accept regardless of whether we are able to intercept
-		tlsConns <- conn
-		return
-	}
-
-	logger.Debugf("Got TLS connection for destination %s", proxConn.OriginalDestination())
-
-	// trim the port suffix
-	originalHostname := strings.Split(proxConn.OriginalDestination(), ":")[0]
-	if getCert != nil {
-		cert, err := getCert(originalHostname)
-		if err == nil && cert != nil {
-			// the certificate we have allows us to intercept this connection
-			tlsConns <- conn
-			return
-		}
+func handleConn(logger logrus.FieldLogger, c net.Conn) error {
+	originalAddr, err := getOriginalAddr(c)
+	if err != nil {
+		return err
 	}
 
 	// cannot intercept so will just transparently proxy instead
-	logger.Debugf("No certificate able to intercept connections to %s, proxying instead.", originalHostname)
-	destConn, err := net.Dial(conn.LocalAddr().Network(), proxConn.OriginalDestination())
+	logger.Debugf("No certificate able to intercept connections to %s, proxying instead.", originalAddr)
+	destConn, err := net.Dial(c.LocalAddr().Network(), originalAddr)
 	if err != nil {
-		logger.WithError(err).Debugf("Failed proxying connection to %s, Error while dialing.", originalHostname)
-		_ = conn.Close()
-		return
+		logger.WithError(err).Debugf("Failed proxying connection to %s, Error while dialing.", originalAddr)
+		_ = c.Close()
+		return err
 	}
-	err = forwardConnection(
-		conn,
-		destConn,
-	)
+
+	err = forwardConnection(c, destConn)
 	if err != nil {
-		logger.WithError(err).Warnf("Error proxying connection to %s.", originalHostname)
+		logger.WithError(err).Warnf("Error proxying connection to %s.", originalAddr)
 	}
+
+	return nil
 }
 
-var (
-	tlsPattern  = regexp.MustCompile(`^\x16\x03[\x00-\x03]`) // TLS handshake byte + version number
-	tlsPeekSize = 3
-)
+func getOriginalAddr(c net.Conn) (string, error) {
+	conn, ok := c.(interface {
+		File() (f *os.File, err error)
+	})
+	if !ok {
+		return "", errors.New("not a TCPConn")
+	}
 
-// nonHTTPBouncer wraps a net.Listener and detects whether or not
-// the connection is HTTP. If not then it proxies the connection
-// to the original destination.
-// This is a single purpose version of github.com/soheilhy/cmux
-type nonHTTPBouncer struct {
-	logger logrus.FieldLogger
-	net.Listener
-	tls bool
-}
-
-var (
-	httpPeekSize = 8
-	// These are the HTTP methods we are interested in handling. Anything else gets bounced.
-	httpPattern = regexp.MustCompile(`^(CONNECT)|(POST)|(PRI) `)
-)
-
-type proxiedConnection interface {
-	OriginalDestination() string
-}
-
-func (b nonHTTPBouncer) Accept() (net.Conn, error) {
-	conn, err := b.Listener.Accept()
+	file, err := conn.File()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+	defer file.Close()
 
-	proxConn, ok := conn.(proxiedConnection)
-	if !ok || proxConn.OriginalDestination() == "" {
-		// unknown (direct?) connection, must handle it ourselves
-		return conn, nil
-	}
-
-	peekedConn := peekconn.New(conn)
-	match, err := peekedConn.PeekMatch(httpPattern, httpPeekSize)
+	const SO_ORIGINAL_DST = 80
+	addr, err := syscall.GetsockoptIPv6Mreq(int(file.Fd()), syscall.SOL_IP, SO_ORIGINAL_DST)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	if match {
-		// this is a connection we want to handle
-		return peekedConn, nil
+
+	var ip net.IP
+	switch binary.LittleEndian.Uint16(addr.Multiaddr[:2]) {
+	case syscall.AF_INET:
+		ip = addr.Multiaddr[4:8]
+	default:
+		return "", errors.New("unrecognized address family")
 	}
-	b.logger.Debugf("Bouncing non-HTTP connection to destination %s", proxConn.OriginalDestination())
 
-	// proxy this connection without interception
-	go func() {
-		destination := proxConn.OriginalDestination()
-		var destConn net.Conn
-		if b.tls {
-			destConn, err = tls.Dial(conn.LocalAddr().Network(), destination, nil)
-		} else {
-			destConn, err = net.Dial(conn.LocalAddr().Network(), destination)
-		}
-		if err != nil {
-			b.logger.WithError(err).Warnf("Error proxying connection to %s.", destination)
-			return
-		}
+	port := int(addr.Multiaddr[2])<<8 + int(addr.Multiaddr[3])
 
-		err := forwardConnection(
-			peekedConn,
-			destConn,
-		)
-		if err != nil {
-			b.logger.WithError(err).Warnf("Error proxying connection to %s.", destination)
-		}
-	}()
-
-	return b.Accept()
+	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), nil
 }
